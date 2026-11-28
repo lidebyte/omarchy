@@ -8,7 +8,15 @@ source "$(dirname "${BASH_SOURCE[0]}")/base-test.sh"
 export HYPRLAND_INSTANCE_SIGNATURE=test
 
 tmpdir=$(mktemp -d)
-trap 'rm -rf "$tmpdir"' EXIT
+bg_pids=()
+cleanup() {
+  if (( ${#bg_pids[@]} > 0 )); then
+    kill "${bg_pids[@]}" 2>/dev/null || true
+    wait "${bg_pids[@]}" 2>/dev/null || true
+  fi
+  rm -rf "$tmpdir"
+}
+trap cleanup EXIT
 
 stub_dir="$tmpdir/bin"
 home_dir="$tmpdir/home"
@@ -168,6 +176,7 @@ if command -v script >/dev/null; then
 
   script -qfc "sleep 30" "$tmpdir/typescript" >/dev/null 2>&1 &
   script_pid=$!
+  bg_pids+=("$script_pid")
   for _ in {1..50}; do pgrep -P "$script_pid" >/dev/null && break; sleep 0.1; done
 
   # Only the foot lookup is faked; anything else goes to the real pgrep. Every
@@ -180,9 +189,12 @@ if command -v script >/dev/null; then
     : >"$tmpdir/pgrep.log"
     HOME="$foot_home" PATH="$tmpdir/foot-bin:$ROOT/bin:$PATH" omarchy-theme-set-foot
     sleep 0.3
-    # A kernel without CONFIG_PROC_CHILDREN needs a second scan for the shells.
+    # Reading tty-index from foot's own fdinfo needs only the initial pgrep;
+    # a kernel without tty-index or CONFIG_PROC_CHILDREN needs a second scan.
     scans=1
-    [[ -e /proc/$script_pid/task/$script_pid/children ]] || scans=2
+    if ! grep -q '^tty-index:' "/proc/$script_pid/fdinfo"/* 2>/dev/null && [[ ! -e /proc/$script_pid/task/$script_pid/children ]]; then
+      scans=2
+    fi
     (( $(wc -l <"$tmpdir/pgrep.log") == scans )) || fail "a foot retint scans the processes once" "$(cat "$tmpdir/pgrep.log")"
   }
 
@@ -193,11 +205,46 @@ if command -v script >/dev/null; then
   grep -qF $'\e]11;[65]#102030' "$tmpdir/typescript" || fail "running foot terminals turn glassy"
   pass "running foot terminals take the theme's background alpha, found in one process scan"
 
-  # A kernel without CONFIG_PROC_CHILDREN has no children list. A foot pid with
-  # no /proc entry stands in for that, and its shell is then found by pgrep -P.
+  # A child that redirects stdin, stdout, and stderr away from the PTY cannot
+  # be reached through child fds at all, exercising foot's /proc fdinfo path.
+  script -qfc "exec </dev/null >$tmpdir/all-redir.log 2>&1; sleep 30" "$tmpdir/typescript-fdinfo" >/dev/null 2>&1 &
+  fdinfo_pid=$!
+  bg_pids+=("$fdinfo_pid")
+  for _ in {1..50}; do
+    fdinfo_child=$(pgrep -P "$fdinfo_pid" | head -1 || true)
+    if [[ -n $fdinfo_child && -e $tmpdir/all-redir.log ]] && [[ $(readlink "/proc/$fdinfo_child/fd/0" 2>/dev/null || true) == "/dev/null" ]]; then
+      break
+    fi
+    sleep 0.1
+  done
+  if grep -q '^tty-index:' "/proc/$fdinfo_pid/fdinfo"/* 2>/dev/null; then
+    mkdir -p "$tmpdir/fdinfo-bin"
+    printf '#!/bin/bash\nif [[ $1 == "-x" && $2 == "foot" ]]; then echo %s; else exec %q "$@"; fi\n' \
+      "$fdinfo_pid" "$real_pgrep" >"$tmpdir/fdinfo-bin/pgrep"
+    chmod +x "$tmpdir/fdinfo-bin/pgrep"
+    printf 'background = "#304050"\nforeground = "#ffffff"\n' >"$foot_theme/colors.toml"
+    HOME="$foot_home" PATH="$tmpdir/fdinfo-bin:$ROOT/bin:$PATH" omarchy-theme-set-foot
+    sleep 0.3
+    grep -qF '#304050' "$tmpdir/typescript-fdinfo" || fail "foot terminals retint via /proc fdinfo even when the child redirects stdin/stdout/stderr"
+    pass "foot terminals retint via /proc fdinfo when the child redirects all stdio"
+  else
+    skip "foot terminals retint via /proc fdinfo: kernel does not expose tty-index"
+  fi
+
+  # A kernel without tty-index or CONFIG_PROC_CHILDREN falls back to pgrep -P
+  # and child fds (checking fd/0 when a child like agy redirects fd/1 and fd/2).
+  script -qfc "exec >$tmpdir/child.log 2>&1; sleep 30" "$tmpdir/typescript-redirected" >/dev/null 2>&1 &
+  redir_pid=$!
+  bg_pids+=("$redir_pid")
+  for _ in {1..50}; do
+    shell_pid=$(pgrep -P "$redir_pid" | head -1 || true)
+    if [[ -n $shell_pid && -e $tmpdir/child.log ]] && [[ $(readlink "/proc/$shell_pid/fd/1" 2>/dev/null || true) == "$tmpdir/child.log" ]]; then
+      break
+    fi
+    sleep 0.1
+  done
   missing_pid=4194303
   if [[ ! -e /proc/$missing_pid ]]; then
-    shell_pid=$(pgrep -P "$script_pid" | head -1)
     mkdir -p "$tmpdir/no-children-bin"
     printf '#!/bin/bash\nif [[ $1 == "-x" && $2 == "foot" ]]; then echo %s; elif [[ $1 == "-P" && $2 == %s ]]; then echo %s; else exit 1; fi\n' \
       "$missing_pid" "$missing_pid" "$shell_pid" >"$tmpdir/no-children-bin/pgrep"
@@ -205,12 +252,12 @@ if command -v script >/dev/null; then
     printf 'background = "#203040"\nforeground = "#ffffff"\n' >"$foot_theme/colors.toml"
     HOME="$foot_home" PATH="$tmpdir/no-children-bin:$ROOT/bin:$PATH" omarchy-theme-set-foot
     sleep 0.3
-    grep -qF '#203040' "$tmpdir/typescript" || fail "foot terminals retint without the kernel's children list"
-    pass "foot terminals retint without the kernel's children list"
+    grep -qF '#203040' "$tmpdir/typescript-redirected" || fail "foot terminals retint via child-fd fallback when stdout/stderr are redirected"
+    pass "foot terminals retint via child-fd fallback with redirected stdout/stderr"
   else
     skip "foot terminals retint without the kernel's children list: pid $missing_pid exists"
   fi
-  kill "$script_pid" 2>/dev/null || true
+  kill "$script_pid" "$fdinfo_pid" "$redir_pid" 2>/dev/null || true
 else
   skip "script is not installed"
 fi

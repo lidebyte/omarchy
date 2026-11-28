@@ -9,7 +9,9 @@ foot_ini=$HOME/.local/state/omarchy/current/theme/foot.ini
 [[ -f $colors_toml ]] || exit 0
 
 # Theme switches wait on this retint, and pgrep scans every process, so it runs
-# once; each terminal's shells come from the kernel's list of its children.
+# once; each terminal's PTY comes from foot's own /dev/ptmx fdinfo (which works
+# even when a direct child launched with -e redirects stdout, like agy, and for
+# foot --server with multiple windows), falling back to child fds if needed.
 foot_pids=$(pgrep -x foot) || exit 0
 
 foot_osc=$(omarchy-theme-osc "$colors_toml")
@@ -25,7 +27,29 @@ if [[ -n $background ]]; then
   foot_osc+=$(printf '\033]11;[%d]%s\007' "$percent" "$background")
 fi
 
+declare -A seen_ttys=()
+write_tty() {
+  local tty="$1"
+  [[ $tty == /dev/pts/* && -z ${seen_ttys[$tty]:-} ]] || return 0
+  seen_ttys[$tty]=1
+  { printf '%s' "$foot_osc" >"$tty"; } 2>/dev/null || true
+}
+
 for foot_pid in $foot_pids; do
+  found=false
+  for fdinfo in "/proc/$foot_pid/fdinfo"/*; do
+    [[ -r $fdinfo ]] || continue
+    {
+      while IFS=$' \t:' read -r key value _; do
+        if [[ $key == "tty-index" && $value =~ ^[0-9]+$ ]]; then
+          write_tty "/dev/pts/$value"
+          found=true
+        fi
+      done <"$fdinfo"
+    } 2>/dev/null || true
+  done
+  [[ $found == true ]] && continue
+
   children="/proc/$foot_pid/task/$foot_pid/children"
   if [[ -e $children ]]; then
     { child_pids=$(<"$children"); } 2>/dev/null || continue
@@ -34,9 +58,12 @@ for foot_pid in $foot_pids; do
     child_pids=$(pgrep -P "$foot_pid")
   fi
   for child_pid in $child_pids; do
-    tty=$(readlink "/proc/$child_pid/fd/1" 2>/dev/null)
-    if [[ $tty == /dev/pts/* ]]; then
-      { printf '%s' "$foot_osc" >"$tty"; } 2>/dev/null || true
-    fi
+    for fd in 1 0 2; do
+      tty=$(readlink "/proc/$child_pid/fd/$fd" 2>/dev/null)
+      if [[ $tty == /dev/pts/* ]]; then
+        write_tty "$tty"
+        break
+      fi
+    done
   done
 done
